@@ -1,0 +1,527 @@
+#!/usr/bin/env bash
+# svc - A human- and agent-friendly macOS launchd service manager
+# Inspired by systemctl, pm2, and lunchy. Zero dependencies, pure bash.
+#
+# MIT License - https://github.com/iridite/svc
+
+set -eo pipefail
+
+VERSION="0.1.0"
+UID_VAL="$(id -u)"
+GUI_DOMAIN="gui/${UID_VAL}"
+
+# Standard directories where user/system LaunchAgents/LaunchDaemons reside
+USER_AGENTS="${HOME}/Library/LaunchAgents"
+GLOBAL_AGENTS="/Library/LaunchAgents"
+GLOBAL_DAEMONS="/Library/LaunchDaemons"
+
+# Color support: auto-detect TTY or respects NO_COLOR
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  C_RESET="\033[0m"
+  C_BOLD="\033[1m"
+  C_GREEN="\033[32m"
+  C_RED="\033[31m"
+  C_YELLOW="\033[33m"
+  C_CYAN="\033[36m"
+  C_GRAY="\033[90m"
+else
+  C_RESET=""
+  C_BOLD=""
+  C_GREEN=""
+  C_RED=""
+  C_YELLOW=""
+  C_CYAN=""
+  C_GRAY=""
+fi
+
+JSON_MODE=0
+
+usage() {
+  cat <<EOF
+${C_BOLD}svc${C_RESET} - Human- and agent-friendly macOS service manager (v${VERSION})
+
+${C_BOLD}USAGE:${C_RESET}
+    svc <command> [service] [options]
+
+${C_BOLD}COMMANDS:${C_RESET}
+    ${C_CYAN}list${C_RESET}                List all managed/user services and their statuses
+    ${C_CYAN}status${C_RESET}   <name>     Show detailed status of a service
+    ${C_CYAN}start${C_RESET}    <name>     Start a service (kickstart or bootstrap)
+    ${C_CYAN}stop${C_RESET}     <name>     Stop a service (kill or bootout if KeepAlive)
+    ${C_CYAN}restart${C_RESET}  <name>     Restart a service
+    ${C_CYAN}log${C_RESET}      <name>     Tail stdout/stderr logs of a service (-n <lines>, -f)
+    ${C_CYAN}cat${C_RESET}      <name>     Print the service's plist definition
+    ${C_CYAN}which${C_RESET}    <name>     Print the resolved plist path and label
+    ${C_CYAN}enable${C_RESET}   <name>     Enable the service in launchd
+    ${C_CYAN}disable${C_RESET}  <name>     Disable the service in launchd
+    ${C_CYAN}version${C_RESET}             Show svc version
+
+${C_BOLD}OPTIONS:${C_RESET}
+    ${C_YELLOW}--json${C_RESET}              Output machine-readable JSON (ideal for AI agents / scripts)
+    ${C_YELLOW}-h, --help${C_RESET}          Show this help message
+
+${C_BOLD}EXAMPLES:${C_RESET}
+    svc list
+    svc status relay
+    svc start relay
+    svc stop relay
+    svc log hapi -n 50 -f
+    svc status hapi --json
+EOF
+  exit 0
+}
+
+# Resolve service pattern (e.g., "relay", "hapi", "com.openalice.relay") to:
+# RESOLVED_LABEL, RESOLVED_PLIST, RESOLVED_DOMAIN
+resolve_service() {
+  local query="$1"
+  if [[ -z "${query}" ]]; then
+    echo -e "${C_RED}Error: Service name or pattern required.${C_RESET}" >&2
+    exit 1
+  fi
+
+  # 1. Search in ~/Library/LaunchAgents first (primary target)
+  local matches=()
+  local f name
+  if [[ -d "${USER_AGENTS}" ]]; then
+    for f in "${USER_AGENTS}"/*.plist; do
+      [[ -e "${f}" ]] || continue
+      name="$(basename "${f}" .plist)"
+      if [[ "${name}" == "${query}" ]] || [[ "${name}" == *"${query}"* ]]; then
+        matches+=("${f}")
+      fi
+    done
+  fi
+
+  # 2. If not found, search loaded launchd services
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    local loaded_labels
+    loaded_labels="$(launchctl list | awk -v q="${query}" 'NR>1 && $3 ~ q {print $3}')"
+    for l in ${loaded_labels}; do
+      # check if plist path can be found via launchctl print
+      local p
+      p="$(launchctl print "${GUI_DOMAIN}/${l}" 2>/dev/null | awk -F' = ' '/path =/ {print $2}' || true)"
+      if [[ -n "${p}" ]] && [[ -f "${p}" ]]; then
+        matches+=("${p}")
+      fi
+    done
+  fi
+
+  # 3. Handle matches count
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    if [[ ${JSON_MODE} -eq 1 ]]; then
+      echo "{\"error\": \"not_found\", \"query\": \"${query}\"}"
+    else
+      echo -e "${C_RED}Error: No service matching '${query}' found in ${USER_AGENTS} or active launchd.${C_RESET}" >&2
+    fi
+    exit 1
+  elif [[ ${#matches[@]} -gt 1 ]]; then
+    # Exact match tie-breaker
+    local exact=""
+    for m in "${matches[@]}"; do
+      name="$(basename "${m}" .plist)"
+      if [[ "${name}" == "${query}" ]] || [[ "${name}" == *"com.${query}"* ]]; then
+        exact="${m}"
+        break
+      fi
+    done
+    if [[ -n "${exact}" ]]; then
+      matches=("${exact}")
+    else
+      if [[ ${JSON_MODE} -eq 1 ]]; then
+        echo "{\"error\": \"ambiguous_match\", \"query\": \"${query}\", \"matches\": ["
+        local first=1
+        for m in "${matches[@]}"; do
+          [[ ${first} -eq 0 ]] && echo ","
+          first=0
+          echo -n "  \"$(basename "${m}" .plist)\""
+        done
+        echo "]}"
+      else
+        echo -e "${C_YELLOW}Multiple services matched '${query}':${C_RESET}" >&2
+        for m in "${matches[@]}"; do
+          echo "  - $(basename "${m}" .plist) (${m})" >&2
+        done
+        echo "Please specify a more specific name." >&2
+      fi
+      exit 1
+    fi
+  fi
+
+  RESOLVED_PLIST="${matches[0]}"
+  # Read Label from plist or fallback to basename
+  RESOLVED_LABEL="$(plutil -extract Label raw -o - "${RESOLVED_PLIST}" 2>/dev/null || basename "${RESOLVED_PLIST}" .plist)"
+  RESOLVED_DOMAIN="${GUI_DOMAIN}"
+}
+
+# Inspect status of resolved service
+# Sets: IS_LOADED, IS_RUNNING, PID_VAL, LAST_EXIT, KEEPALIVE_VAL, RUNATLOAD_VAL, STDOUT_PATH, STDERR_PATH
+inspect_service() {
+  local label="$1"
+  local plist="$2"
+
+  IS_LOADED=0
+  IS_RUNNING=0
+  PID_VAL="-"
+  LAST_EXIT="-"
+  KEEPALIVE_VAL="false"
+  RUNATLOAD_VAL="false"
+  STDOUT_PATH=""
+  STDERR_PATH=""
+
+  if [[ -f "${plist}" ]]; then
+    KEEPALIVE_VAL="$(plutil -extract KeepAlive raw -o - "${plist}" 2>/dev/null || echo "false")"
+    RUNATLOAD_VAL="$(plutil -extract RunAtLoad raw -o - "${plist}" 2>/dev/null || echo "false")"
+    STDOUT_PATH="$(plutil -extract StandardOutPath raw -o - "${plist}" 2>/dev/null || echo "")"
+    STDERR_PATH="$(plutil -extract StandardErrorPath raw -o - "${plist}" 2>/dev/null || echo "")"
+  fi
+
+  local print_out
+  if print_out="$(launchctl print "${RESOLVED_DOMAIN}/${label}" 2>/dev/null)"; then
+    IS_LOADED=1
+    local p
+    p="$(echo "${print_out}" | awk '/pid =/ {print $3}' | tr -d ' ')"
+    if [[ -n "${p}" ]] && [[ "${p}" != "0" ]]; then
+      PID_VAL="${p}"
+      IS_RUNNING=1
+    fi
+    local code
+    code="$(echo "${print_out}" | awk -F' = ' '/last exit code =/ {print $2}')"
+    [[ -n "${code}" ]] && LAST_EXIT="${code}"
+  fi
+}
+
+cmd_list() {
+  local items=()
+  local f name label plist
+  if [[ -d "${USER_AGENTS}" ]]; then
+    for f in "${USER_AGENTS}"/*.plist; do
+      [[ -e "${f}" ]] || continue
+      items+=("${f}")
+    done
+  fi
+
+  if [[ ${JSON_MODE} -eq 1 ]]; then
+    echo "["
+    local first=1
+    for plist in "${items[@]}"; do
+      label="$(plutil -extract Label raw -o - "${plist}" 2>/dev/null || basename "${plist}" .plist)"
+      RESOLVED_DOMAIN="${GUI_DOMAIN}"
+      inspect_service "${label}" "${plist}"
+      [[ ${first} -eq 0 ]] && echo ","
+      first=0
+      cat <<EOF
+  {
+    "name": "$(basename "${plist}" .plist)",
+    "label": "${label}",
+    "plist": "${plist}",
+    "loaded": $(( IS_LOADED == 1 ? 1 : 0 )),
+    "running": $(( IS_RUNNING == 1 ? 1 : 0 )),
+    "pid": $( [[ "${PID_VAL}" =~ ^[0-9]+$ ]] && echo "${PID_VAL}" || echo "null" ),
+    "last_exit": "${LAST_EXIT}",
+    "keepalive": ${KEEPALIVE_VAL},
+    "run_at_load": ${RUNATLOAD_VAL},
+    "stdout": "${STDOUT_PATH}",
+    "stderr": "${STDERR_PATH}"
+  }
+EOF
+    done
+    echo "]"
+    return 0
+  fi
+
+  # Human table
+  printf "${C_BOLD}%-26s %-10s %-8s %-12s %s${C_RESET}\n" "SERVICE" "STATUS" "PID" "RESTART/RUN" "PLIST"
+  printf "%s\n" "---------------------------------------------------------------------------------------------------"
+  for plist in "${items[@]}"; do
+    label="$(plutil -extract Label raw -o - "${plist}" 2>/dev/null || basename "${plist}" .plist)"
+    RESOLVED_DOMAIN="${GUI_DOMAIN}"
+    inspect_service "${label}" "${plist}"
+    local short_name
+    short_name="$(basename "${plist}" .plist)"
+    # Strip common prefix for compact view
+    short_name="${short_name#com.}"
+
+    local status_str
+    if [[ ${IS_RUNNING} -eq 1 ]]; then
+      status_str="${C_GREEN}● active${C_RESET}"
+    elif [[ ${IS_LOADED} -eq 1 ]]; then
+      status_str="${C_GRAY}○ loaded${C_RESET}"
+    else
+      status_str="${C_RED}○ stopped${C_RESET}"
+    fi
+
+    local type_str="on-demand"
+    [[ "${KEEPALIVE_VAL}" == "true" ]] && type_str="keep-alive"
+
+    printf "%-26s %-19b %-8s %-12s %s\n" \
+      "${short_name:0:25}" \
+      "${status_str}" \
+      "${PID_VAL}" \
+      "${type_str}" \
+      "${plist/#$HOME/~}"
+  done
+}
+
+cmd_status() {
+  inspect_service "${RESOLVED_LABEL}" "${RESOLVED_PLIST}"
+
+  if [[ ${JSON_MODE} -eq 1 ]]; then
+    cat <<EOF
+{
+  "name": "$(basename "${RESOLVED_PLIST}" .plist)",
+  "label": "${RESOLVED_LABEL}",
+  "plist": "${RESOLVED_PLIST}",
+  "loaded": $(( IS_LOADED == 1 ? 1 : 0 )),
+  "running": $(( IS_RUNNING == 1 ? 1 : 0 )),
+  "pid": $( [[ "${PID_VAL}" =~ ^[0-9]+$ ]] && echo "${PID_VAL}" || echo "null" ),
+  "last_exit": "${LAST_EXIT}",
+  "keepalive": ${KEEPALIVE_VAL},
+  "run_at_load": ${RUNATLOAD_VAL},
+  "stdout": "${STDOUT_PATH}",
+  "stderr": "${STDERR_PATH}"
+}
+EOF
+    return 0
+  fi
+
+  local symbol="${C_RED}○${C_RESET}"
+  local state_text="stopped (not loaded)"
+  if [[ ${IS_RUNNING} -eq 1 ]]; then
+    symbol="${C_GREEN}●${C_RESET}"
+    state_text="${C_GREEN}active (running)${C_RESET}"
+  elif [[ ${IS_LOADED} -eq 1 ]]; then
+    symbol="${C_YELLOW}●${C_RESET}"
+    state_text="${C_YELLOW}loaded (idle/not running)${C_RESET}"
+  fi
+
+  echo -e "${symbol} ${C_BOLD}${RESOLVED_LABEL}${C_RESET} - $(basename "${RESOLVED_PLIST}" .plist)"
+  echo -e "     Loaded: ${IS_LOADED} (${RESOLVED_PLIST})"
+  echo -e "     Active: ${state_text}"
+  echo -e "        PID: ${PID_VAL}"
+  echo -e "  Last Exit: ${LAST_EXIT}"
+  echo -e "  KeepAlive: ${KEEPALIVE_VAL}"
+  echo -e "  RunAtLoad: ${RUNATLOAD_VAL}"
+  [[ -n "${STDOUT_PATH}" ]] && echo -e "     Stdout: ${STDOUT_PATH}"
+  [[ -n "${STDERR_PATH}" ]] && echo -e "     Stderr: ${STDERR_PATH}"
+}
+
+cmd_start() {
+  inspect_service "${RESOLVED_LABEL}" "${RESOLVED_PLIST}"
+  launchctl enable "${RESOLVED_DOMAIN}/${RESOLVED_LABEL}" 2>/dev/null || true
+
+  if [[ ${IS_LOADED} -eq 0 ]]; then
+    launchctl bootstrap "${RESOLVED_DOMAIN}" "${RESOLVED_PLIST}"
+  fi
+
+  # If not running or on-demand, kickstart it
+  launchctl kickstart -k "${RESOLVED_DOMAIN}/${RESOLVED_LABEL}" 2>/dev/null || true
+
+  # Re-inspect
+  sleep 0.2
+  inspect_service "${RESOLVED_LABEL}" "${RESOLVED_PLIST}"
+  if [[ ${JSON_MODE} -eq 1 ]]; then
+    cmd_status
+  else
+    if [[ ${IS_RUNNING} -eq 1 ]] || [[ ${IS_LOADED} -eq 1 ]]; then
+      echo -e "${C_GREEN}✓ Started ${RESOLVED_LABEL}${C_RESET} (PID: ${PID_VAL})"
+    else
+      echo -e "${C_RED}✗ Failed to start ${RESOLVED_LABEL}${C_RESET}" >&2
+      exit 1
+    fi
+  fi
+}
+
+cmd_stop() {
+  inspect_service "${RESOLVED_LABEL}" "${RESOLVED_PLIST}"
+
+  if [[ ${IS_LOADED} -eq 0 ]] && [[ ${IS_RUNNING} -eq 0 ]]; then
+    if [[ ${JSON_MODE} -eq 1 ]]; then
+      echo "{\"status\": \"already_stopped\", \"label\": \"${RESOLVED_LABEL}\"}"
+    else
+      echo -e "${C_GRAY}Service ${RESOLVED_LABEL} is already stopped.${C_RESET}"
+    fi
+    return 0
+  fi
+
+  # If KeepAlive=true, killing the process makes launchd immediately respawn it!
+  # So we MUST bootout KeepAlive services to genuinely stop them.
+  # For on-demand services (KeepAlive=false), kill SIGTERM cleanly leaves them loaded but idle.
+  if [[ "${KEEPALIVE_VAL}" == "true" ]]; then
+    launchctl bootout "${RESOLVED_DOMAIN}/${RESOLVED_LABEL}" 2>/dev/null || true
+  else
+    launchctl kill SIGTERM "${RESOLVED_DOMAIN}/${RESOLVED_LABEL}" 2>/dev/null || true
+  fi
+
+  sleep 0.2
+  inspect_service "${RESOLVED_LABEL}" "${RESOLVED_PLIST}"
+  if [[ ${JSON_MODE} -eq 1 ]]; then
+    cmd_status
+  else
+    echo -e "${C_GREEN}✓ Stopped ${RESOLVED_LABEL}${C_RESET}"
+  fi
+}
+
+cmd_restart() {
+  inspect_service "${RESOLVED_LABEL}" "${RESOLVED_PLIST}"
+  if [[ "${KEEPALIVE_VAL}" == "true" ]]; then
+    # For KeepAlive, kickstart -k forces launchd to kill and respawn
+    launchctl kickstart -k "${RESOLVED_DOMAIN}/${RESOLVED_LABEL}" 2>/dev/null || cmd_start
+  else
+    # For on-demand, kill then kickstart
+    cmd_stop >/dev/null 2>&1 || true
+    cmd_start >/dev/null 2>&1 || true
+  fi
+
+  sleep 0.2
+  inspect_service "${RESOLVED_LABEL}" "${RESOLVED_PLIST}"
+  if [[ ${JSON_MODE} -eq 1 ]]; then
+    cmd_status
+  else
+    echo -e "${C_GREEN}✓ Restarted ${RESOLVED_LABEL}${C_RESET} (PID: ${PID_VAL})"
+  fi
+}
+
+cmd_log() {
+  inspect_service "${RESOLVED_LABEL}" "${RESOLVED_PLIST}"
+  local log_file="${STDOUT_PATH}"
+  if [[ -z "${log_file}" ]] || [[ ! -f "${log_file}" ]]; then
+    log_file="${STDERR_PATH}"
+  fi
+
+  if [[ -z "${log_file}" ]]; then
+    echo -e "${C_RED}Error: No StandardOutPath or StandardErrorPath configured in ${RESOLVED_PLIST}${C_RESET}" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "${log_file}" ]]; then
+    echo -e "${C_YELLOW}Log file does not exist yet: ${log_file}${C_RESET}" >&2
+    exit 1
+  fi
+
+  echo -e "${C_GRAY}# Tailing ${log_file} ...${C_RESET}"
+  tail "${LOG_ARGS[@]}" "${log_file}"
+}
+
+cmd_cat() {
+  if command -v bat >/dev/null 2>&1; then
+    bat "${RESOLVED_PLIST}"
+  else
+    cat "${RESOLVED_PLIST}"
+  fi
+}
+
+cmd_which() {
+  if [[ ${JSON_MODE} -eq 1 ]]; then
+    echo "{\"label\": \"${RESOLVED_LABEL}\", \"plist\": \"${RESOLVED_PLIST}\", \"domain\": \"${RESOLVED_DOMAIN}\"}"
+  else
+    echo -e "Label:  ${RESOLVED_LABEL}"
+    echo -e "Plist:  ${RESOLVED_PLIST}"
+    echo -e "Domain: ${RESOLVED_DOMAIN}"
+  fi
+}
+
+cmd_enable() {
+  launchctl enable "${RESOLVED_DOMAIN}/${RESOLVED_LABEL}"
+  echo -e "${C_GREEN}✓ Enabled ${RESOLVED_LABEL}${C_RESET}"
+}
+
+cmd_disable() {
+  launchctl disable "${RESOLVED_DOMAIN}/${RESOLVED_LABEL}"
+  echo -e "${C_YELLOW}✓ Disabled ${RESOLVED_LABEL}${C_RESET}"
+}
+
+# --- CLI Dispatcher ---
+
+COMMAND="${1:-}"
+[[ -z "${COMMAND}" ]] && usage
+
+shift || true
+
+# Parse flags & target
+TARGET=""
+LOG_ARGS=("-n" "50")
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)
+      JSON_MODE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      ;;
+    -f|--follow)
+      LOG_ARGS+=("-f")
+      shift
+      ;;
+    -n|--lines)
+      LOG_ARGS=("-n" "$2")
+      shift 2
+      ;;
+    -*)
+      echo -e "${C_RED}Unknown option: $1${C_RESET}" >&2
+      exit 1
+      ;;
+    *)
+      if [[ -z "${TARGET}" ]]; then
+        TARGET="$1"
+      else
+        LOG_ARGS+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+case "${COMMAND}" in
+  list|ls)
+    cmd_list
+    ;;
+  version|-v|--version)
+    echo "svc version ${VERSION}"
+    ;;
+  status)
+    resolve_service "${TARGET}"
+    cmd_status
+    ;;
+  start)
+    resolve_service "${TARGET}"
+    cmd_start
+    ;;
+  stop)
+    resolve_service "${TARGET}"
+    cmd_stop
+    ;;
+  restart)
+    resolve_service "${TARGET}"
+    cmd_restart
+    ;;
+  log|logs)
+    resolve_service "${TARGET}"
+    cmd_log
+    ;;
+  cat)
+    resolve_service "${TARGET}"
+    cmd_cat
+    ;;
+  which)
+    resolve_service "${TARGET}"
+    cmd_which
+    ;;
+  enable)
+    resolve_service "${TARGET}"
+    cmd_enable
+    ;;
+  disable)
+    resolve_service "${TARGET}"
+    cmd_disable
+    ;;
+  help)
+    usage
+    ;;
+  *)
+    echo -e "${C_RED}Unknown command: ${COMMAND}${C_RESET}" >&2
+    usage
+    ;;
+esac
