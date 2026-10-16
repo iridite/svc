@@ -17,13 +17,13 @@ GLOBAL_DAEMONS="/Library/LaunchDaemons"
 
 # Color support: auto-detect TTY or respects NO_COLOR
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
-  C_RESET="\033[0m"
-  C_BOLD="\033[1m"
-  C_GREEN="\033[32m"
-  C_RED="\033[31m"
-  C_YELLOW="\033[33m"
-  C_CYAN="\033[36m"
-  C_GRAY="\033[90m"
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'
+  C_RED=$'\033[31m'
+  C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'
+  C_GRAY=$'\033[90m'
 else
   C_RESET=""
   C_BOLD=""
@@ -185,9 +185,11 @@ inspect_service() {
       PID_VAL="${p}"
       IS_RUNNING=1
     fi
-    local code
-    code="$(echo "${print_out}" | awk -F' = ' '/last exit code =/ {print $2}')"
-    [[ -n "${code}" ]] && LAST_EXIT="${code}"
+    local code=""
+    code="$(echo "${print_out}" | awk -F' = ' '/last exit code =/ {print $2}' || true)"
+    if [[ -n "${code}" ]]; then
+      LAST_EXIT="${code}"
+    fi
   fi
 }
 
@@ -242,21 +244,29 @@ EOF
     # Strip common prefix for compact view
     short_name="${short_name#com.}"
 
-    local status_str
+    local sym text color
     if [[ ${IS_RUNNING} -eq 1 ]]; then
-      status_str="${C_GREEN}● active${C_RESET}"
+      sym="●"
+      text="active"
+      color="${C_GREEN}"
     elif [[ ${IS_LOADED} -eq 1 ]]; then
-      status_str="${C_GRAY}○ loaded${C_RESET}"
+      sym="○"
+      text="loaded"
+      color="${C_GRAY}"
     else
-      status_str="${C_RED}○ stopped${C_RESET}"
+      sym="○"
+      text="stopped"
+      color="${C_RED}"
     fi
 
     local type_str="on-demand"
     [[ "${KEEPALIVE_VAL}" == "true" ]] && type_str="keep-alive"
 
-    printf "%-26s %-19b %-8s %-12s %s\n" \
+    # Format columns: name (26), symbol + text (12), pid (8), type (12), plist
+    printf "%-26s ${color}%s %-9s${C_RESET} %-8s %-12s %s\n" \
       "${short_name:0:25}" \
-      "${status_str}" \
+      "${sym}" \
+      "${text}" \
       "${PID_VAL}" \
       "${type_str}" \
       "${plist/#$HOME/~}"
