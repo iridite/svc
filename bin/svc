@@ -167,8 +167,9 @@ inspect_service() {
   KEEPALIVE_VAL="false"
   RUNATLOAD_VAL="false"
   STDOUT_PATH=""
+  IS_DISABLED=0
+  STDOUT_PATH=""
   STDERR_PATH=""
-
   if [[ -f "${plist}" ]]; then
     KEEPALIVE_VAL="$(plutil -extract KeepAlive raw -o - "${plist}" 2>/dev/null || echo "false")"
     RUNATLOAD_VAL="$(plutil -extract RunAtLoad raw -o - "${plist}" 2>/dev/null || echo "false")"
@@ -190,6 +191,10 @@ inspect_service() {
     if [[ -n "${code}" ]]; then
       LAST_EXIT="${code}"
     fi
+  fi
+
+  if launchctl print-disabled "${RESOLVED_DOMAIN}" 2>/dev/null | grep -q "\"${label}\" => disabled"; then
+    IS_DISABLED=1
   fi
 }
 
@@ -221,9 +226,9 @@ cmd_list() {
     "running": $(( IS_RUNNING == 1 ? 1 : 0 )),
     "pid": $( [[ "${PID_VAL}" =~ ^[0-9]+$ ]] && echo "${PID_VAL}" || echo "null" ),
     "last_exit": "${LAST_EXIT}",
+    "disabled": $(( IS_DISABLED == 1 ? 1 : 0 )),
     "keepalive": ${KEEPALIVE_VAL},
     "run_at_load": ${RUNATLOAD_VAL},
-    "stdout": "${STDOUT_PATH}",
     "stderr": "${STDERR_PATH}"
   }
 EOF
@@ -245,7 +250,11 @@ EOF
     short_name="${short_name#com.}"
 
     local sym text color
-    if [[ ${IS_RUNNING} -eq 1 ]]; then
+    if [[ ${IS_DISABLED} -eq 1 ]]; then
+      sym="!"
+      text="disabled"
+      color="${C_YELLOW}"
+    elif [[ ${IS_RUNNING} -eq 1 ]]; then
       sym="●"
       text="active"
       color="${C_GREEN}"
@@ -284,6 +293,7 @@ cmd_status() {
   "plist": "${RESOLVED_PLIST}",
   "loaded": $(( IS_LOADED == 1 ? 1 : 0 )),
   "running": $(( IS_RUNNING == 1 ? 1 : 0 )),
+  "disabled": $(( IS_DISABLED == 1 ? 1 : 0 )),
   "pid": $( [[ "${PID_VAL}" =~ ^[0-9]+$ ]] && echo "${PID_VAL}" || echo "null" ),
   "last_exit": "${LAST_EXIT}",
   "keepalive": ${KEEPALIVE_VAL},
@@ -297,14 +307,16 @@ EOF
 
   local symbol="${C_RED}○${C_RESET}"
   local state_text="stopped (not loaded)"
-  if [[ ${IS_RUNNING} -eq 1 ]]; then
+  if [[ ${IS_DISABLED} -eq 1 ]]; then
+    symbol="${C_YELLOW}!${C_RESET}"
+    state_text="${C_YELLOW}disabled (in launchd)${C_RESET}"
+  elif [[ ${IS_RUNNING} -eq 1 ]]; then
     symbol="${C_GREEN}●${C_RESET}"
     state_text="${C_GREEN}active (running)${C_RESET}"
   elif [[ ${IS_LOADED} -eq 1 ]]; then
     symbol="${C_YELLOW}●${C_RESET}"
     state_text="${C_YELLOW}loaded (idle/not running)${C_RESET}"
   fi
-
   echo -e "${symbol} ${C_BOLD}${RESOLVED_LABEL}${C_RESET} - $(basename "${RESOLVED_PLIST}" .plist)"
   echo -e "     Loaded: ${IS_LOADED} (${RESOLVED_PLIST})"
   echo -e "     Active: ${state_text}"
@@ -437,8 +449,12 @@ cmd_enable() {
 }
 
 cmd_disable() {
+  inspect_service "${RESOLVED_LABEL}" "${RESOLVED_PLIST}"
+  if [[ ${IS_LOADED} -eq 1 ]] || [[ ${IS_RUNNING} -eq 1 ]]; then
+    cmd_stop >/dev/null 2>&1 || true
+  fi
   launchctl disable "${RESOLVED_DOMAIN}/${RESOLVED_LABEL}"
-  echo -e "${C_YELLOW}✓ Disabled ${RESOLVED_LABEL}${C_RESET}"
+  echo -e "${C_YELLOW}✓ Disabled ${RESOLVED_LABEL} (stopped & persistent disabled in launchd)${C_RESET}"
 }
 
 # --- CLI Dispatcher ---
