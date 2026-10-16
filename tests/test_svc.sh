@@ -70,5 +70,14 @@ svc stop relay >/dev/null
 OUT="$(svc status relay --json)"
 assert_match '"running": 0' "${OUT}" "svc stop relay puts service into stopped state"
 
+# 9. Enable / Disable lifecycle test
+svc disable relay >/dev/null
+OUT="$(svc status relay --json)"
+assert_match '"disabled": 1' "${OUT}" "svc disable relay marks service disabled in json"
+
+svc enable relay >/dev/null
+OUT="$(svc status relay --json)"
+assert_match '"disabled": 0' "${OUT}" "svc enable relay restores service enabled in json"
+
 echo "=== Results: ${PASS} passed, ${FAIL} failed ==="
 [[ ${FAIL} -eq 0 ]] || exit 1

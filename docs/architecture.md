@@ -75,9 +75,20 @@ One of `launchctl`'s biggest traps is that killing a process does not always sto
 |    - Start:  launchctl bootstrap gui/<uid> <plist>                 |
 |    - Stop:   launchctl bootout gui/<uid>/<label> (unloaded)        |
 |    - Restart: launchctl kickstart -k gui/<uid>/<label>             |
+|                                                                    |
+|  Persistent Disabled State:                                        |
+|    - svc disable: bootout + launchctl disable gui/<uid>/<label>    |
+|    - svc enable:  launchctl enable gui/<uid>/<label>               |
 +--------------------------------------------------------------------+
 ```
 
+### Disabled State Storage (Zero Plist Mutations)
+In macOS `launchd`, disabled services are recorded in the per-user launchd state store (viewable via `launchctl print-disabled gui/<uid>`). When a service is disabled:
+1. `launchd` blocks `bootstrap` of that service label (returns `Bootstrap failed: 5: Input/output error`).
+2. Even if the plist has `RunAtLoad=true`, `launchd` will **NOT** load or run the service at login.
+3. The `.plist` on disk remains completely untouched, pristine, and git-friendly.
+
+`svc` queries `launchctl print-disabled` during every inspection pass and tags disabled services with `! disabled` in `svc list` and `svc status`.
 ---
 
 ## 4. Fuzzy Resolution

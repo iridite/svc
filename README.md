@@ -30,9 +30,10 @@ Managing local background services on macOS with native `launchctl` has been pai
 ## ✨ Features
 
 - **🚀 Systemctl-style Commands**: `svc start`, `svc stop`, `svc restart`, `svc status`, `svc list`.
+- **🔒 Native Enable / Disable**: `svc enable` and `svc disable` to persist boot/login autostart in macOS launchd's disabled database without mutating plist files.
 - **🔍 Smart Fuzzy Matching**: Run `svc start relay` instead of `svc start com.mycompany.openalice.relay`.
 - **🛡️ KeepAlive Aware**: Transparently distinguishes on-demand services (clean signal kill) from persistent daemons (`bootout` to prevent unwanted auto-respawn).
-- **📋 Live Colored Status Table**: Clean terminal view of all your LaunchAgents, running PIDs, and active states.
+- **📋 Live Colored Status Table**: Clean terminal view of all your LaunchAgents, running PIDs, and active/disabled states.
 - **📜 Automatic Log Tailing**: `svc log <name> -f` parses `StandardOutPath` / `StandardErrorPath` directly from plist and streams the log.
 - **🤖 Native AI-Agent Protocol**: First-class `--json` flag on every command for structured, predictable output with AI coding tools (Claude Code, Codex, OMP).
 - **📦 Zero External Dependencies**: 100% pure POSIX/Bash. No Node.js, no Python, no Rust, no Homebrew required.
@@ -45,7 +46,7 @@ Managing local background services on macOS with native `launchctl` has been pai
 $ svc list
 SERVICE                    STATUS     PID      RESTART/RUN  PLIST
 ---------------------------------------------------------------------------------------------------
-hapi.runner                ● active   3582     keep-alive   ~/Library/LaunchAgents/com.hapi.runner.plist
+hapi.runner                ! disabled -        keep-alive   ~/Library/LaunchAgents/com.hapi.runner.plist
 openalice.relay            ○ loaded   -        on-demand    ~/Library/LaunchAgents/com.openalice.relay.plist
 yixian.omp-session-tidy    ○ loaded   -        on-demand    ~/Library/LaunchAgents/com.yixian.omp-session-tidy.plist
 ```
@@ -74,8 +75,9 @@ $ svc status relay
 | **Stop persistent daemon** | `launchctl bootout gui/501/com.foo` | `svc stop foo` |
 | **Service status** | `launchctl print gui/501/com.foo` *(100+ raw lines)* | `svc status foo` *(clean summary)* |
 | **Follow logs** | Find plist $\rightarrow$ read XML $\rightarrow$ `tail -f <path>` | `svc log foo -f` |
+| **Disable autostart** | `launchctl disable gui/501/com.foo` + `bootout` | `svc disable foo` *(no plist editing)* |
+| **Enable autostart** | `launchctl enable gui/501/com.foo` | `svc enable foo` |
 | **Machine / Agent JSON** | ❌ Not supported | `svc status foo --json` |
-
 ---
 
 ## 🚀 Installation
@@ -108,7 +110,8 @@ svc start <name>       # Start or trigger a service
 svc stop <name>        # Stop a service (handles KeepAlive correctly)
 svc restart <name>     # Restart a service
 svc status <name>      # Show detailed status card
-
+svc enable <name>      # Enable service to run/autostart at login
+svc disable <name>     # Stop & disable service (prevents login autostart without touching plist)
 # Inspection & Logs
 svc list               # List all user LaunchAgents
 svc log <name> -f      # Follow live logs (stdout/stderr)
